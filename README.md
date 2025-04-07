@@ -75,8 +75,7 @@ This project demonstrates your expertise in modern web development, cloud infras
 
 ## Repository Structure
 
-/ (root) 
-
+	     / (root) 
              ├── chrome-extension/ # Chrome extension files
 		 │ ├── manifest.json # Extension manifest 
 		 │ ├── background.js # Background script for capturing screenshots and API calls 
