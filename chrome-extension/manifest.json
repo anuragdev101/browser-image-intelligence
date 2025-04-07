@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "MCQ Solver Trigger (Relay v1)",
+  "version": "1.2",
+  "description": "Detects Alt+X, captures tab, sends image via Lambda/WSS to Host.",
+  "permissions": [
+    "scripting",
+    "activeTab",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

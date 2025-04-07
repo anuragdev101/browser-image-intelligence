@@ -1,0 +1,647 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Description": "CloudFormation stack for MCQ Solver (v2.2 S3 URLs & Lambda Authorizer).",
+    "Parameters": {
+    "WebSocketConnectSecret": {
+      "Type": "String",
+      "Description": "The shared secret required to connect to the WebSocket API ($connect route). Create it via AWS apigateway console",
+      "NoEcho": true
+    }
+  },
+    "Resources": {
+        "MCQUploadBucket": {
+            "Type": "AWS::S3::Bucket",
+            "Properties": {
+                "BucketName": {
+                    "Fn::Sub": "mcq-solver-uploads-${AWS::AccountId}-${AWS::Region}"
+                },
+                "CorsConfiguration": {
+                    "CorsRules": [{
+                            "AllowedHeaders": ["*"],
+                            "AllowedMethods": ["PUT", "POST"],
+                            "AllowedOrigins": ["*"],
+                            "MaxAge": 3000,
+                            "ExposedHeaders": ["ETag"]
+                        }
+                    ]
+                },
+                "LifecycleConfiguration": {
+                    "Rules": [{
+                            "Id": "DeleteOldUploads",
+                            "Status": "Enabled",
+                            "ExpirationInDays": 1
+                        }
+                    ]
+                },
+                "PublicAccessBlockConfiguration": {
+                    "BlockPublicAcls": true,
+                    "BlockPublicPolicy": true,
+                    "IgnorePublicAcls": true,
+                    "RestrictPublicBuckets": true
+                }
+            }
+        },
+        "WebSocketConnectionsTable": {
+            "Type": "AWS::DynamoDB::Table",
+            "Properties": {
+                "TableName": "MCQWebSocketConnections",
+                "AttributeDefinitions": [{
+                        "AttributeName": "connectionId",
+                        "AttributeType": "S"
+                    }
+                ],
+                "KeySchema": [{
+                        "AttributeName": "connectionId",
+                        "KeyType": "HASH"
+                    }
+                ],
+                "BillingMode": "PAY_PER_REQUEST"
+            }
+        },
+        "MCQWebSocketLambdaRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "RoleName": "MCQWebSocketLambdaRole",
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": ["lambda.amazonaws.com"]
+                            },
+                            "Action": ["sts:AssumeRole"]
+                        }
+                    ]
+                },
+                "ManagedPolicyArns": ["arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"],
+                "Policies": [{
+                        "PolicyName": "MCQDynamoDBAccessPolicy",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [{
+                                    "Effect": "Allow",
+                                    "Action": ["dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Scan"],
+                                    "Resource": {
+                                        "Fn::GetAtt": ["WebSocketConnectionsTable", "Arn"]
+                                    }
+                                }
+                            ]
+                        }
+                    }, {
+                        "PolicyName": "MCQAPIGatewayWebSocketManageConnections",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [{
+                                    "Effect": "Allow",
+                                    "Action": ["execute-api:ManageConnections"],
+                                    "Resource": [{
+                                            "Fn::Sub": "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }, {
+                        "PolicyName": "MCQS3UploadBucketPermissions",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [{
+                                    "Effect": "Allow",
+                                    "Action": ["s3:PutObject"],
+                                    "Resource": {
+                                        "Fn::Sub": "arn:aws:s3:::${MCQUploadBucket}/*"
+                                    }
+                                }
+                            ]
+                        }
+                    }, {
+                        "PolicyName": "MCQValidateApiKeysPolicy",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [{
+                                    "Effect": "Allow",
+                                    "Action": ["apigateway:GET"],
+                                    "Resource": [{
+                                            "Fn::Sub": "arn:aws:apigateway:${AWS::Region}::/apikeys"
+                                        }, {
+                                            "Fn::Sub": "arn:aws:apigateway:${AWS::Region}::/apikeys/*"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "ApiGatewayLogRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "RoleName": "MCQApiGatewayLogRole",
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": ["apigateway.amazonaws.com"]
+                            },
+                            "Action": ["sts:AssumeRole"]
+                        }
+                    ]
+                },
+                "ManagedPolicyArns": ["arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"]
+            }
+        },
+        "ConnectHandlerFunction": {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "FunctionName": "mcqConnectHandler",
+                "Runtime": "python3.10",
+                "Role": {
+                    "Fn::GetAtt": ["MCQWebSocketLambdaRole", "Arn"]
+                },
+                "Handler": "index.lambda_handler",
+                "Environment": {
+                    "Variables": {
+                        "TABLE_NAME": {
+                            "Ref": "WebSocketConnectionsTable"
+                        },
+                        "WEBSOCKET_SECRET": { "Ref": "WebSocketConnectSecret" }
+                    }
+                },
+                "Code": {
+                    "ZipFile": {
+                        "Fn::Join": ["\n", ["import json", "import boto3", "import os", "import logging", "", "logger = logging.getLogger()", "logger.setLevel(logging.INFO)", "", "TABLE_NAME = os.environ.get('TABLE_NAME')", "EXPECTED_SECRET = os.environ.get('WEBSOCKET_SECRET')", "dynamodb, table = None, None", "if not TABLE_NAME:", "    logger.error('TABLE_NAME missing!')", "else:", "    try:", "        dynamodb = boto3.resource('dynamodb')", "        table = dynamodb.Table(TABLE_NAME)", "    except Exception as e:", "        logger.error(f'Failed init DB: {e}')", "", "def lambda_handler(event, context):", "    connection_id = event.get('requestContext',{}).get('connectionId')", "    query_params = event.get('queryStringParameters', {})", "    received_secret = query_params.get('auth')", "    source_ip = event.get('requestContext',{}).get('identity',{}).get('sourceIp')", "    logger.info(f'Connect req: {connection_id} from IP: {source_ip}')", "", "    if not EXPECTED_SECRET:", "         logger.error('CRITICAL: WEBSOCKET_SECRET not set!')", "         return {'statusCode': 500, 'body': 'Config Error'}", "    if received_secret != EXPECTED_SECRET:", "         logger.warning(f'Forbidden: Invalid secret. Expected: ...{EXPECTED_SECRET[-4:] if EXPECTED_SECRET else None}, Got: {received_secret}')", "         return {'statusCode': 403, 'body': 'Forbidden'}", "", "    logger.info(f'Authorized connect for {connection_id}')", "    if not table:", "         logger.error('Server config error: DB table missing.')", "         return {'statusCode': 500, 'body': 'Server Config Error'}", "    if not connection_id:", "         logger.error('Bad req: No connectionId')", "         return {'statusCode': 400, 'body': 'Bad Request'}", "    try:", "        table.put_item(Item={'connectionId': connection_id})", "        logger.info(f'ConnId {connection_id} added to {TABLE_NAME}.')", "        return {'statusCode': 200, 'body': 'Connected.'}", "    except Exception as e:", "        logger.error(f'Failed add connId {connection_id}: {e}')", "        return {'statusCode': 500, 'body': 'Connection storage failed.'}"]]
+                    }
+                }
+            }
+        },
+        "DisconnectHandlerFunction": {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "FunctionName": "mcqDisconnectHandler",
+                "Runtime": "python3.10",
+                "Role": {
+                    "Fn::GetAtt": ["MCQWebSocketLambdaRole", "Arn"]
+                },
+                "Handler": "index.lambda_handler",
+                "Environment": {
+                    "Variables": {
+                        "TABLE_NAME": {
+                            "Ref": "WebSocketConnectionsTable"
+                        }
+                    }
+                },
+                "Code": {
+                    "ZipFile": {
+                        "Fn::Join": ["\n", ["import json", "import boto3", "import os", "import logging", "", "logger = logging.getLogger()", "logger.setLevel(logging.INFO)", "", "TABLE_NAME = os.environ.get('TABLE_NAME')", "dynamodb, table = None, None", "if not TABLE_NAME:", "    logger.error('TABLE_NAME missing!')", "else:", "    try:", "        dynamodb = boto3.resource('dynamodb')", "        table = dynamodb.Table(TABLE_NAME)", "    except Exception as e:", "        logger.error(f'Failed init DB: {e}')", "", "def lambda_handler(event, context):", "    if not table:", "         logger.error('Server config error: DB table.')", "         return {'statusCode': 200, 'body': 'Disconnected (server config error).'}", "    connection_id = event.get('requestContext',{}).get('connectionId')", "    if not connection_id:", "         logger.warning('No connectionId on disconnect.')", "         return {'statusCode': 200, 'body': 'Disconnected (bad event).'}", "    logger.info(f'Disconnect req: {connection_id}')", "    try:", "        table.delete_item(Key={'connectionId': connection_id})", "        logger.info(f'ConnId {connection_id} removed from {TABLE_NAME}.')", "        return {'statusCode': 200, 'body': 'Disconnected.'}", "    except Exception as e:", "        logger.error(f'Failed remove connId {connection_id}: {e}')", "        return {'statusCode': 200, 'body': 'Disconnected (DB cleanup error).'}"]]
+                    }
+                }
+            }
+        },
+        "GetS3UploadUrlHandlerFunction": {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "FunctionName": "mcqGetS3UploadUrlHandler",
+                "Runtime": "python3.10",
+                "Role": {
+                    "Fn::GetAtt": ["MCQWebSocketLambdaRole", "Arn"]
+                },
+                "Handler": "index.lambda_handler",
+                "Timeout": 15,
+                "Environment": {
+                    "Variables": {
+                        "UPLOAD_BUCKET_NAME": {
+                            "Ref": "MCQUploadBucket"
+                        }
+                    }
+                },
+                "Code": {
+                    "ZipFile": {
+                        "Fn::Join": ["\n", ["import json", "import boto3", "import os", "import uuid", "import logging", "", "logger = logging.getLogger()", "logger.setLevel(logging.INFO)", "", "S3_BUCKET = os.environ.get('UPLOAD_BUCKET_NAME')", "SIGNED_URL_EXPIRATION = 300", "ALLOWED_CONTENT_TYPE_PREFIX = 'image/'", "MAX_UPLOAD_SIZE_BYTES = 5 * 1024 * 1024", "", "s3_client = None", "if S3_BUCKET:", "    try:", "        s3_client = boto3.client('s3')", "        logger.info(f'S3 Client init for bucket {S3_BUCKET}')", "    except Exception as e:", "        logger.error(f'Failed S3 client init: {e}')", "", "def lambda_handler(event, context):", "    logger.info('GetS3UploadUrlHandler invoked.')", "    headers = {'Content-Type': 'application/json','Access-Control-Allow-Origin': '*','Access-Control-Allow-Headers': 'Content-Type','Access-Control-Allow-Methods': 'POST, OPTIONS'}", "    if not s3_client or not S3_BUCKET:", "        logger.error('Server Config Error: S3 client/bucket missing.')", "        return {'statusCode': 500, 'headers': headers, 'body': json.dumps({'error': 'S3 config error.'})}", "", "    try:", "        object_key = f'uploads/{uuid.uuid4()}.png'", "        content_type = 'image/png'", "        fields = {'Content-Type': content_type}", "        conditions = [{'Content-Type': content_type},['content-length-range', 1, MAX_UPLOAD_SIZE_BYTES]]", "        presigned_post_data = s3_client.generate_presigned_post(", "            Bucket=S3_BUCKET,", "            Key=object_key,", "            Fields=fields,", "            Conditions=conditions,", "            ExpiresIn=SIGNED_URL_EXPIRATION", ")", "        logger.info(f'Generated pre-signed POST URL for key: {object_key}')", "        return {'statusCode': 200,'headers': headers,'body': json.dumps({'uploadUrl': presigned_post_data['url'],'fields': presigned_post_data['fields'],'key': object_key})}", "    except Exception as e:", "        logger.error(f'Error generating pre-signed POST URL: {e}')", "        import traceback; traceback.print_exc()", "        return {'statusCode': 500, 'headers': headers, 'body': json.dumps({'error': 'Failed to generate upload URL.'})}"]]
+                    }
+                }
+            }
+        },
+        "TriggerHandlerFunction": {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "FunctionName": "mcqTriggerHandler",
+                "Runtime": "python3.10",
+                "Role": {
+                    "Fn::GetAtt": ["MCQWebSocketLambdaRole", "Arn"]
+                },
+                "Handler": "index.lambda_handler",
+                "Timeout": 30,
+                "Environment": {
+                    "Variables": {
+                        "TABLE_NAME": {
+                            "Ref": "WebSocketConnectionsTable"
+                        },
+                        "WSS_API_ENDPOINT": {
+                            "Fn::Sub": "https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+                        },
+                        "S3_BUCKET_NAME_FOR_HANDLER": {
+                            "Ref": "MCQUploadBucket"
+                        }
+                    }
+                },
+                "Code": {
+                    "ZipFile": {
+                        "Fn::Join": ["\n", ["import json", "import boto3", "import os", "import logging", "import traceback", "import datetime", "", "logger = logging.getLogger()", "logger.setLevel(logging.INFO)", "", "TABLE_NAME = os.environ.get('TABLE_NAME')", "WSS_API_ENDPOINT = os.environ.get('WSS_API_ENDPOINT')", "S3_BUCKET = os.environ.get('S3_BUCKET_NAME_FOR_HANDLER')", "", "session = None", "lambda_region = 'unknown'", "dynamodb, table = None, None", "gatewayapi = None", "initialization_error = None", "", "try:", "    session = boto3.session.Session()", "    lambda_region = session.region_name", "    if not lambda_region: lambda_region = 'unknown'; logger.warning('Boto3 session region None.')", "    else: logger.info(f'Lambda region: {lambda_region}')", "except Exception as session_e:", "    logger.error(f'Failed session: {session_e}')", "", "if TABLE_NAME:", "    logger.info(f'Attempt init DynamoDB: {TABLE_NAME} in {lambda_region}')", "    try:", "        dynamodb = boto3.resource('dynamodb', region_name=lambda_region if lambda_region != 'unknown' else None)", "        table = dynamodb.Table(TABLE_NAME)", "        logger.info(f'DynamoDB initialized.')", "    except Exception as e:", "        initialization_error = f'DynamoDB init failed: {e}'", "        logger.error(initialization_error); logger.error(traceback.format_exc()); table = None", "else:", "    initialization_error = 'TABLE_NAME env var missing.'", "    logger.error(initialization_error)", "", "if WSS_API_ENDPOINT:", "    logger.info(f'Attempt init APIGW Mgmt client: {WSS_API_ENDPOINT}')", "    try:", "          gatewayapi = boto3.client('apigatewaymanagementapi', endpoint_url=WSS_API_ENDPOINT)", "          logger.info(f'API GW Mgmt client created.')", "    except Exception as e:", "         if initialization_error: initialization_error += f' | APIGW Mgmt client init failed: {e}'", "         else: initialization_error = f'APIGW Mgmt client init failed: {e}'", "         logger.error(initialization_error); logger.error(traceback.format_exc()); gatewayapi = None", "else:", "     if initialization_error: initialization_error += ' | WSS_API_ENDPOINT missing.'", "     else: initialization_error = 'WSS_API_ENDPOINT missing.'", "     logger.error(initialization_error)", "", "def lambda_handler(event, context):", "    global table, gatewayapi", "    invocation_start_time = datetime.datetime.utcnow()", "    logger.info('TriggerHandler invoked.')", "    logger.debug(f'Event: {json.dumps(event)}')", "", "    headers = {'Content-Type': 'application/json','Access-Control-Allow-Origin': '*' }", "", "    if initialization_error:", "        logger.error(f'Terminating due to init error: {initialization_error}')", "        return {'statusCode': 500, 'headers': headers, 'body': json.dumps({'message': f'Server Error: {initialization_error}'})}", "", "    if not table or not gatewayapi:", "         logger.error('Server Error: DB/APIGW client missing.')", "         return {'statusCode': 500, 'headers': headers, 'body': json.dumps({'message': 'Internal Server Config Error.'})}", "", "    request_body_str = event.get('body')", "    if not request_body_str:", "        logger.error('Req body missing.')", "        return {'statusCode': 400, 'headers': headers, 'body': json.dumps({'message': 'Missing body.'})}", "", "    logger.info(f'Received body (type {type(request_body_str)}). Snippet: {request_body_str[:150]}...')", "", "    try:", "        body_data = json.loads(request_body_str)", "        action = body_data.get('action')", "        s3_object_key = body_data.get('s3Key')", "        if action != 'relayS3Key' or not s3_object_key:", "            log_msg = f'Invalid payload. Action:{action}, Key:{s3_object_key}. Expected action=relayS3Key and s3Key.'", "            logger.error(log_msg)", "            return {'statusCode': 400, 'headers': headers, 'body': json.dumps({'message': log_msg})}", "", "        logger.info(f'Parsed request to relay S3 key: {s3_object_key}')", "    except json.JSONDecodeError as e:", "        logger.error(f'Failed JSON parse: {e}. Body: {request_body_str[:500]}')", "        return {'statusCode': 400, 'headers': headers, 'body': json.dumps({'message': f'Invalid JSON: {e}'})}", "    except Exception as e:", "        logger.error(f'Error processing body: {e}')", "        logger.error(traceback.format_exc())", "        return {'statusCode': 500, 'headers': headers, 'body': json.dumps({'message': 'Error processing body.'})}", "", "    connection_ids = []", "    items_scanned_count = 0", "    error_message = None", "    scan_success = False", "    last_evaluated_key = None", "    logger.info(f\"Scanning {TABLE_NAME}...\")", "    try:", "        perform_consistent_read = True", "        logger.info(f'DDB Scan ConsistentRead={perform_consistent_read}')", "        scan_kwargs = {'ConsistentRead': perform_consistent_read,'ProjectionExpression': 'connectionId'}", "        while True:", "            if last_evaluated_key:", "                logger.info(f'Paginating scan from: {last_evaluated_key}')", "                scan_kwargs['ExclusiveStartKey'] = last_evaluated_key", "            response = table.scan(**scan_kwargs)", "            items = response.get('Items', [])", "            items_scanned_count += len(items)", "            logger.debug(f'Scan page returned {len(items)} raw items.')", "            page_connection_ids = [item.get('connectionId') for item in items if isinstance(item, dict) and item.get('connectionId') and isinstance(item.get('connectionId'), str)]", "            connection_ids.extend(page_connection_ids)", "            logger.debug(f'Extracted {len(page_connection_ids)} IDs from page.')", "            last_evaluated_key = response.get('LastEvaluatedKey')", "            if not last_evaluated_key:", "                break", "        scan_success = True", "        scan_end_time = datetime.datetime.utcnow()", "        scan_duration_ms = (scan_end_time - invocation_start_time).total_seconds() * 1000", "        logger.info(f'Scan complete (~{scan_duration_ms:.0f} ms). Found {len(connection_ids)} total ID(s).')", "    except Exception as e:", "        logger.error(f'EXCEPTION scanning {TABLE_NAME}: {e}')", "        logger.error(traceback.format_exc())", "        error_message = f'Scan Exception: {type(e).__name__}'", "        scan_success = False", "", "    if not scan_success:", "        return {'statusCode': 500, 'headers': headers, 'body': json.dumps({'message': f'Internal error getting connections: {error_message}'})}", "", "    if not connection_ids:", "        logger.info('No active connections found.')", "        return {'statusCode': 200, 'headers': headers, 'body': json.dumps({'message': 'Trigger OK, no hosts connected.'})}", "", "    message_to_send_dict = {'action': 'processS3Image','s3Key': s3_object_key}", "    if S3_BUCKET:", "        message_to_send_dict['s3Bucket'] = S3_BUCKET", "    else:", "        logger.warning('S3_BUCKET missing, not in relay msg.')", "    message_to_send_str = json.dumps(message_to_send_dict)", "    logger.info(f'Relaying message to WSS clients: {message_to_send_str}')", "    try:", "        message_payload_bytes = message_to_send_str.encode('utf-8')", "    except Exception as encode_err:", "         logger.error(f'Failed encode relay msg: {encode_err}')", "         return {'statusCode': 500, 'headers': headers, 'body': json.dumps({'message': 'Server error encoding relay msg.'})}", "", "    logger.info(f'Attempting post_to_connection for {len(connection_ids)} connection(s)...')", "    post_errors = []", "    success_count = 0", "    stale_count = 0", "    for connection_id in connection_ids:", "        try:", "            gatewayapi.post_to_connection(ConnectionId=connection_id, Data=message_payload_bytes)", "            success_count += 1", "        except gatewayapi.exceptions.GoneException:", "            logger.warning(f'ConnId {connection_id} gone. Cleaning.')", "            stale_count += 1", "            try: table.delete_item(Key={'connectionId': connection_id})", "            except Exception as db_del_e: logger.error(f'Failed delete stale {connection_id}: {db_del_e}')", "        except gatewayapi.exceptions.PayloadTooLargeException:", "             logger.error(f'UNEXPECTED WSS PayloadTooLarge: {connection_id}.')", "             post_errors.append(f'{connection_id}: PayloadTooLarge?')", "        except Exception as e:", "            logger.error(f'Failed post to {connection_id}: {type(e).__name__} - {e}')", "            logger.error(traceback.format_exc())", "            post_errors.append(f'{connection_id}: {type(e).__name__}')", "    logger.info(f'WSS Relay done. Success: {success_count}, Stale: {stale_count}, Errors: {len(post_errors)}')", "    if post_errors:", "         logger.error(f'Errors during post_to_connection: {post_errors}')", "", "    final_message = ''", "    if success_count > 0:", "        final_message = f'S3 key relayed to {success_count} host(s).'", "        if post_errors: final_message += f' Errors: {post_errors}'", "        final_status = 200", "    elif not connection_ids:", "         final_status = 200", "         final_message = 'No active hosts.'", "    else:", "        final_status = 500", "        final_message = f'Failed to relay S3 key. Errors: {post_errors}'", "", "    logger.info(f'Returning HTTP Status {final_status}.')", "    return {'statusCode': final_status, 'headers': headers, 'body': json.dumps({'message': final_message})}"]]
+                    }
+                }
+            }
+        },
+        "ApiKeyAuthorizerFunction": {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "FunctionName": "mcqApiKeyAuthorizer",
+                "Runtime": "python3.10",
+                "Role": {
+                    "Fn::GetAtt": ["MCQWebSocketLambdaRole", "Arn"]
+                },
+                "Handler": "index.lambda_handler",
+                "Timeout": 5,
+                "Code": {
+                    "ZipFile": {
+                        "Fn::Join": ["\n", ["import json", "import boto3", "import os", "import logging", "import traceback", "", "logger = logging.getLogger()", "logger.setLevel(logging.INFO)", "", "apigateway_client = None", "try:", "    apigateway_client = boto3.client('apigateway')", "    logger.info('API Gateway Client initialized for Authorizer.')", "except Exception as e:", "    logger.error(f'Failed to init APIGateway client: {e}')", "", "def build_policy(principal_id, effect, resource, context=None):", "    policy = {'principalId': principal_id,'policyDocument': {'Version': '2012-10-17','Statement': [{'Action': 'execute-api:Invoke','Effect': effect,'Resource': resource}]}}", "    if context and isinstance(context, dict):", "        policy['context'] = context", "    return policy", "", "def lambda_handler(event, context):", "    logger.info(f'Authorizer invoked. Event type: {event.get(\"type\")}')", "    logger.debug(f'Full Event: {json.dumps(event)}')", "", "    effect = 'Deny'", "    principal_id = 'unauthorized'", "    api_key_value = None", "    policy_resource = event.get('routeArn', '*')", "", "    if not apigateway_client:", "         logger.error('Authorizer cannot proceed: API Gateway client failed init.')", "         return build_policy(principal_id, 'Deny', policy_resource, {'error':'Authorizer Misconfiguration'})", "", "    headers = event.get('headers', {})", "    api_key_value = headers.get('x-api-key')", "", "    if not api_key_value:", "        logger.warning('No x-api-key header found.')", "        return build_policy(principal_id, 'Deny', policy_resource, {'reason':'API Key missing'})", "", "    logger.info(f'Found API Key header (masked): ...{api_key_value[-4:] if len(api_key_value)>3 else api_key_value}')", "", "    try:", "        logger.info('Attempting to validate API key via apigateway:GET /apikeys...')", "        key_is_valid = False", "        paginator = apigateway_client.get_paginator('get_api_keys')", "        for page in paginator.paginate(includeValues=True):", "            for item in page.get('items', []):", "                if item.get('value') == api_key_value and item.get('enabled', False):", "                    logger.info(f'API Key validated successfully. Key ID: {item[\"id\"]}')", "                    key_is_valid = True", "                    principal_id = item.get('name', item['id'])", "                    break", "            if key_is_valid: break", "", "        if key_is_valid:", "            effect = 'Allow'", "        else:", "            logger.warning(f'API Key validation failed: Key value not found/enabled.')", "            effect = 'Deny'", "", "    except Exception as e:", "        logger.error(f'Exception during API Key validation: {e}')", "        logger.error(traceback.format_exc())", "        effect = 'Deny'", "        principal_id = 'validation_error'", "", "    auth_response = build_policy(principal_id, effect, policy_resource)", "    logger.info(f'Returning authorization policy: Effect={effect}, Principal={principal_id}')", "    return auth_response"]]
+                    }
+                }
+            }
+        },
+        "WebSocketApi": {
+            "Type": "AWS::ApiGatewayV2::Api",
+            "Properties": {
+                "Name": "MCQSolverWebSocketAPI",
+                "ProtocolType": "WEBSOCKET",
+                "RouteSelectionExpression": "$request.body.action"
+            }
+        },
+        "ConnectIntegration": {
+            "Type": "AWS::ApiGatewayV2::Integration",
+            "Properties": {
+                "ApiId": {
+                    "Ref": "WebSocketApi"
+                },
+                "IntegrationType": "AWS_PROXY",
+                "IntegrationUri": {
+                    "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ConnectHandlerFunction.Arn}/invocations"
+                }
+            }
+        },
+        "DisconnectIntegration": {
+            "Type": "AWS::ApiGatewayV2::Integration",
+            "Properties": {
+                "ApiId": {
+                    "Ref": "WebSocketApi"
+                },
+                "IntegrationType": "AWS_PROXY",
+                "IntegrationUri": {
+                    "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DisconnectHandlerFunction.Arn}/invocations"
+                }
+            }
+        },
+        "DefaultIntegration": {
+            "Type": "AWS::ApiGatewayV2::Integration",
+            "Properties": {
+                "ApiId": {
+                    "Ref": "WebSocketApi"
+                },
+                "IntegrationType": "AWS_PROXY",
+                "IntegrationUri": {
+                    "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TriggerHandlerFunction.Arn}/invocations"
+                }
+            }
+        },
+        "ConnectRoute": {
+            "Type": "AWS::ApiGatewayV2::Route",
+            "Properties": {
+                "ApiId": {
+                    "Ref": "WebSocketApi"
+                },
+                "RouteKey": "$connect",
+                "AuthorizationType": "NONE",
+                "Target": {
+                    "Fn::Join": ["/", ["integrations", {
+                                "Ref": "ConnectIntegration"
+                            }
+                        ]]
+                }
+            }
+        },
+        "DisconnectRoute": {
+            "Type": "AWS::ApiGatewayV2::Route",
+            "Properties": {
+                "ApiId": {
+                    "Ref": "WebSocketApi"
+                },
+                "RouteKey": "$disconnect",
+                "AuthorizationType": "NONE",
+                "Target": {
+                    "Fn::Join": ["/", ["integrations", {
+                                "Ref": "DisconnectIntegration"
+                            }
+                        ]]
+                }
+            }
+        },
+        "DefaultRoute": {
+            "Type": "AWS::ApiGatewayV2::Route",
+            "Properties": {
+                "ApiId": {
+                    "Ref": "WebSocketApi"
+                },
+                "RouteKey": "$default",
+                "AuthorizationType": "NONE",
+                "Target": {
+                    "Fn::Join": ["/", ["integrations", {
+                                "Ref": "DefaultIntegration"
+                            }
+                        ]]
+                }
+            }
+        },
+        "WebSocketStage": {
+            "Type": "AWS::ApiGatewayV2::Stage",
+            "Properties": {
+                "ApiId": {
+                    "Ref": "WebSocketApi"
+                },
+                "StageName": "prod",
+                "AutoDeploy": true
+            },
+            "DependsOn": ["ConnectRoute", "DisconnectRoute", "DefaultRoute"]
+        },
+        "HttpApiLogGroup": {
+            "Type": "AWS::Logs::LogGroup",
+            "Properties": {
+                "LogGroupName": {
+                    "Fn::Sub": "/aws/apigateway/MCQTriggerHTTPApi"
+                },
+                "RetentionInDays": 7
+            }
+        },
+        "HttpApi": {
+            "Type": "AWS::ApiGatewayV2::Api",
+            "Properties": {
+                "Name": "MCQTriggerHTTPApi",
+                "ProtocolType": "HTTP",
+                "CorsConfiguration": {
+                    "AllowOrigins": ["*"],
+                    "AllowMethods": ["POST", "OPTIONS"],
+                    "AllowHeaders": ["Content-Type", "Accept", "Origin", "Authorization", "X-Amz-Date", "X-Api-Key", "X-Amz-Security-Token"],
+                    "MaxAge": 300
+                }
+            }
+        },
+        "HttpApiLambdaAuthorizer": {
+            "Type": "AWS::ApiGatewayV2::Authorizer",
+            "Properties": {
+                "ApiId": {
+                    "Ref": "HttpApi"
+                },
+                "AuthorizerType": "REQUEST",
+                "IdentitySource": ["$request.header.x-api-key"],
+                "Name": "ApiKeyLambdaAuthorizer",
+                "AuthorizerUri": {
+                    "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiKeyAuthorizerFunction.Arn}/invocations"
+                },
+                "AuthorizerPayloadFormatVersion": "2.0",
+                "EnableSimpleResponses": false
+            }
+        },
+        "HttpApiS3UrlIntegration": {
+            "Type": "AWS::ApiGatewayV2::Integration",
+            "Properties": {
+                "ApiId": {
+                    "Ref": "HttpApi"
+                },
+                "IntegrationType": "AWS_PROXY",
+                "IntegrationUri": {
+                    "Fn::GetAtt": ["GetS3UploadUrlHandlerFunction", "Arn"]
+                },
+                "PayloadFormatVersion": "2.0"
+            }
+        },
+        "HttpApiS3UrlRoute": {
+            "Type": "AWS::ApiGatewayV2::Route",
+            "Properties": {
+                "ApiId": {
+                    "Ref": "HttpApi"
+                },
+                "RouteKey": "POST /get-upload-url",
+                "Target": {
+                    "Fn::Join": ["/", ["integrations", {
+                                "Ref": "HttpApiS3UrlIntegration"
+                            }
+                        ]]
+                },
+                "AuthorizationType": "CUSTOM",
+                "AuthorizerId": {
+                    "Ref": "HttpApiLambdaAuthorizer"
+                }
+            }
+        },
+        "HttpApiTriggerIntegration": {
+            "Type": "AWS::ApiGatewayV2::Integration",
+            "Properties": {
+                "ApiId": {
+                    "Ref": "HttpApi"
+                },
+                "IntegrationType": "AWS_PROXY",
+                "IntegrationUri": {
+                    "Fn::GetAtt": ["TriggerHandlerFunction", "Arn"]
+                },
+                "PayloadFormatVersion": "2.0",
+                "TimeoutInMillis": 29000
+            }
+        },
+        "HttpApiTriggerRoute": {
+            "Type": "AWS::ApiGatewayV2::Route",
+            "Properties": {
+                "ApiId": {
+                    "Ref": "HttpApi"
+                },
+                "RouteKey": "POST /trigger",
+                "Target": {
+                    "Fn::Join": ["/", ["integrations", {
+                                "Ref": "HttpApiTriggerIntegration"
+                            }
+                        ]]
+                },
+                "AuthorizationType": "CUSTOM",
+                "AuthorizerId": {
+                    "Ref": "HttpApiLambdaAuthorizer"
+                }
+            }
+        },
+        "HttpApiStage": {
+            "Type": "AWS::ApiGatewayV2::Stage",
+            "Properties": {
+                "ApiId": {
+                    "Ref": "HttpApi"
+                },
+                "StageName": "$default",
+                "AutoDeploy": true,
+                "AccessLogSettings": {
+                    "DestinationArn": {
+                        "Fn::GetAtt": ["HttpApiLogGroup", "Arn"]
+                    },
+                    "Format": "{\"requestId\":\"$context.requestId\", \"ip\": \"$context.identity.sourceIp\", \"requestTime\":\"$context.requestTime\", \"httpMethod\":\"$context.httpMethod\",\"routeKey\":\"$context.routeKey\", \"status\":\"$context.status\",\"protocol\":\"$context.protocol\", \"responseLength\":\"$context.responseLength\", \"integrationError\": \"$context.integration.error\", , \"integrationErrorMessage\": \"$context.integrationErrorMessage\",\"integrationStatus\": \"$context.integration.status\", \"lambdaError\": \"$context.error.message\" }"
+                }
+            },
+            "DependsOn": ["HttpApiLogGroup", "ApiGatewayLogRole"]
+        },
+        "ConnectLambdaPermission": {
+            "Type": "AWS::Lambda::Permission",
+            "Properties": {
+                "FunctionName": {
+                    "Fn::GetAtt": ["ConnectHandlerFunction", "Arn"]
+                },
+                "Action": "lambda:InvokeFunction",
+                "Principal": "apigateway.amazonaws.com",
+                "SourceArn": {
+                    "Fn::Sub": "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*"
+                }
+            }
+        },
+        "DisconnectLambdaPermission": {
+            "Type": "AWS::Lambda::Permission",
+            "Properties": {
+                "FunctionName": {
+                    "Fn::GetAtt": ["DisconnectHandlerFunction", "Arn"]
+                },
+                "Action": "lambda:InvokeFunction",
+                "Principal": "apigateway.amazonaws.com",
+                "SourceArn": {
+                    "Fn::Sub": "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*"
+                }
+            }
+        },
+        "GetS3UploadUrlLambdaPermission": {
+            "Type": "AWS::Lambda::Permission",
+            "Properties": {
+                "FunctionName": {
+                    "Fn::GetAtt": ["GetS3UploadUrlHandlerFunction", "Arn"]
+                },
+                "Action": "lambda:InvokeFunction",
+                "Principal": "apigateway.amazonaws.com",
+                "SourceArn": {
+                    "Fn::Sub": "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+                }
+            }
+        },
+        "DefaultRouteLambdaPermission": {
+            "Type": "AWS::Lambda::Permission",
+            "Properties": {
+                "FunctionName": {
+                    "Fn::GetAtt": ["TriggerHandlerFunction", "Arn"]
+                },
+                "Action": "lambda:InvokeFunction",
+                "Principal": "apigateway.amazonaws.com",
+                "SourceArn": {
+                    "Fn::Sub": "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*"
+                }
+            }
+        },
+        "TriggerLambdaPermission": {
+            "Type": "AWS::Lambda::Permission",
+            "Properties": {
+                "FunctionName": {
+                    "Fn::GetAtt": ["TriggerHandlerFunction", "Arn"]
+                },
+                "Action": "lambda:InvokeFunction",
+                "Principal": "apigateway.amazonaws.com",
+                "SourceArn": {
+                    "Fn::Sub": "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+                }
+            }
+        },
+        "ApiKeyAuthorizerLambdaPermission": {
+            "Type": "AWS::Lambda::Permission",
+            "Properties": {
+                "FunctionName": {
+                    "Fn::GetAtt": ["ApiKeyAuthorizerFunction", "Arn"]
+                },
+                "Action": "lambda:InvokeFunction",
+                "Principal": "apigateway.amazonaws.com",
+                "SourceArn": {
+                    "Fn::Sub": "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/authorizers/${HttpApiLambdaAuthorizer}"
+                }
+            }
+        }
+    },
+    "Outputs": {
+        "WebSocketApiEndpoint": {
+            "Description": "WebSocket API endpoint URL (use this in the host app)",
+            "Value": {
+                "Fn::Sub": "wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+            }
+        },
+        "WebSocketApiId": {
+            "Description": "WebSocket API ID",
+            "Value": {
+                "Ref": "WebSocketApi"
+            }
+        },
+        "WebSocketConnectionUrl": {
+            "Description": "WebSocket API Management Endpoint Base URL (for TriggerHandler WSS_API_ENDPOINT)",
+            "Value": {
+                "Fn::Sub": "https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+            }
+        },
+        "HttpApiEndpoint": {
+            "Description": "HTTP API base endpoint URL (use in Extension host_permissions)",
+            "Value": {
+                "Fn::GetAtt": ["HttpApi", "ApiEndpoint"]
+            }
+        },
+        "HttpApiGetUploadUrlEndpoint": {
+            "Description": "HTTP API full URL to get S3 pre-signed POST URL (use this in extension)",
+            "Value": {
+                "Fn::Join": ["", [{
+                            "Fn::GetAtt": ["HttpApi", "ApiEndpoint"]
+                        }, "/get-upload-url"]]
+            }
+        },
+        "HttpApiTriggerUrl": {
+            "Description": "HTTP API full trigger URL (use this in extension after S3 upload)",
+            "Value": {
+                "Fn::Join": ["", [{
+                            "Fn::GetAtt": ["HttpApi", "ApiEndpoint"]
+                        }, "/trigger"]]
+            }
+        },
+        "ImageUploadS3BucketName": {
+            "Description": "Name of the S3 bucket where images are uploaded",
+            "Value": {
+                "Ref": "MCQUploadBucket"
+            }
+        },
+        "HttpApiId": {
+            "Description": "HTTP API ID",
+            "Value": {
+                "Ref": "HttpApi"
+            }
+        },
+        "WebSocketConnectionsTableName": {
+            "Description": "DynamoDB table name",
+            "Value": {
+                "Ref": "WebSocketConnectionsTable"
+            }
+        },
+        "MCQWebSocketLambdaRoleArn": {
+            "Description": "Lambda Execution Role ARN",
+            "Value": {
+                "Fn::GetAtt": ["MCQWebSocketLambdaRole", "Arn"]
+            }
+        },
+        "ApiGatewayLogRoleArn": {
+            "Description": "API Gateway CloudWatch Log Role ARN",
+            "Value": {
+                "Fn::GetAtt": ["ApiGatewayLogRole", "Arn"]
+            }
+        }
+    }
+}
